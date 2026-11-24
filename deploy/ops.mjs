@@ -128,8 +128,8 @@ function validated(values, full = false) {
     for (const name of ['OPENBOT_GOOGLE_CLIENT_ID', 'OPENBOT_GOOGLE_CLIENT_SECRET']) {
       if (!values[name]) throw new Error(`Set ${name} before starting native OpenBot.`);
     }
-    if (!values.CPK_INTELLIGENCE_API_KEY && !values.COPILOTKIT_LICENSE_TOKEN) {
-      throw new Error('Set CPK_INTELLIGENCE_API_KEY or COPILOTKIT_LICENSE_TOKEN before starting native OpenBot.');
+    if (!values.CPK_INTELLIGENCE_API_KEY) {
+      throw new Error('Set CPK_INTELLIGENCE_API_KEY to the Intelligence project runtime key. A self-hosted license does not replace it.');
     }
   }
   requireProtocol(values.INTELLIGENCE_API_URL, 'https:', 'INTELLIGENCE_API_URL');
