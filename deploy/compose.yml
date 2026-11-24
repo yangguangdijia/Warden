@@ -1,0 +1,257 @@
+# Load after ../docker-compose.yml via node deploy/ops.mjs.
+name: ai-platform-portal
+
+x-ops-node: &ops-node
+  image: ai-platform-ops:local
+  pull_policy: never
+  init: true
+  user: '1000:1000'
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: ['/tmp:rw,noexec,nosuid,nodev,size=16m']
+  restart: unless-stopped
+  pids_limit: 64
+  mem_limit: 256m
+  cpus: 0.50
+  logging:
+    driver: json-file
+    options: { max-size: '10m', max-file: '3' }
+
+x-node-health: &node-health
+  interval: 5s
+  timeout: 4s
+  start_period: 10s
+  retries: 12
+
+services:
+  portal:
+    environment:
+      SSRF_ALLOW_PRIVATE_IP_ADDRESS: '0'
+      SSRF_ALLOW_IP_ADDRESS_LIST: 172.30.231.2
+    networks: [data, storage-edge, portal-mcp]
+    pids_limit: 192
+    mem_limit: 2g
+    cpus: 1.50
+
+  postgres:
+    pids_limit: 192
+    mem_limit: 2g
+    cpus: 1.50
+
+  redis:
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 0.50
+
+  storage:
+    pids_limit: 128
+    mem_limit: 1g
+    cpus: 1.00
+
+  storage-init:
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.50
+
+  openbot:
+    # CopilotKit/OpenBot v1.1.2, platform index from container-images.json.
+    image: ghcr.io/copilotkit/openbot@sha256:9d54d34c6bd269e9c2c331e33438ed243e73d031804877e14e57b9ba2934034d
+    restart: unless-stopped
+    ports: ['127.0.0.1:3001:3001']
+    environment:
+      EMBEDDED_POSTGRES: 'on'
+      BETTER_AUTH_URL: http://localhost:3001
+      OPENBOT_PUBLIC_URL: http://localhost:3001
+      OPENBOT_APP_URL: http://localhost:3001
+      TRUSTED_ORIGINS: http://localhost:3001
+      BETTER_AUTH_SECRET: '${OPENBOT_AUTH_SECRET:?Run node deploy/ops.mjs init}'
+      KEY_ENCRYPTION_KEY: '${OPENBOT_ENCRYPTION_KEY:?Run node deploy/ops.mjs init}'
+      OPENBOT_SINGLE_USER: 'false'
+      OPENBOT_TASK_THREADS: 'off'
+      INITIAL_ADMIN_EMAILS: '${OPENBOT_ADMIN_EMAIL:?Set OPENBOT_ADMIN_EMAIL}'
+      SIGNIN_ALLOWED_EMAIL_DOMAINS: '${OPENBOT_SIGNIN_DOMAINS:?Set OPENBOT_SIGNIN_DOMAINS}'
+      GOOGLE_OAUTH_CLIENT_ID: '${OPENBOT_GOOGLE_CLIENT_ID:-}'
+      GOOGLE_OAUTH_CLIENT_SECRET: '${OPENBOT_GOOGLE_CLIENT_SECRET:-}'
+      INTELLIGENCE_API_URL: '${INTELLIGENCE_API_URL:?Set INTELLIGENCE_API_URL}'
+      INTELLIGENCE_GATEWAY_WS_URL: '${INTELLIGENCE_GATEWAY_WS_URL:?Set INTELLIGENCE_GATEWAY_WS_URL}'
+      CPK_INTELLIGENCE_API_KEY: '${CPK_INTELLIGENCE_API_KEY:-}'
+      COPILOTKIT_LICENSE_TOKEN: '${COPILOTKIT_LICENSE_TOKEN:-}'
+      OPENAI_API_KEY: '${OPENBOT_OPENAI_API_KEY:-}'
+      AGENT_COMPUTER_ALLOW_PRIVATE_HOSTS: 'false'
+      AGENT_ENDPOINT_ALLOWED_HOSTS: ops-agent-gateway:4320
+    networks: [openbot-egress, openbot-agent, bridge-openbot]
+    volumes:
+      - openbot-postgres:/var/lib/postgresql
+      - openbot-workspace:/workspace
+      - openbot-profiles:/profiles
+    # v1.1.2 uses /init; preserve its entrypoint and children (API, Chromium, Postgres).
+    healthcheck:
+      test: ['CMD', 'bun', '-e', 'const r = await fetch("http://127.0.0.1:3001/health"); process.exit(r.ok ? 0 : 1)']
+      interval: 10s
+      timeout: 5s
+      start_period: 90s
+      retries: 18
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 2.0
+    logging:
+      driver: json-file
+      options: { max-size: '10m', max-file: '3' }
+
+  ops-mcp-gateway:
+    <<: *ops-node
+    profiles: [ops-ready]
+    command: [node, deploy/gateway.mjs, mcp]
+    environment:
+      OPS_GATEWAY_HOST: 172.30.231.2
+    depends_on:
+      ops-bridge: { condition: service_healthy }
+    networks:
+      portal-mcp: { ipv4_address: 172.30.231.2 }
+      bridge-mcp: {}
+    healthcheck:
+      <<: *node-health
+      test: ['CMD', 'node', '-e', 'fetch("http://172.30.231.2:4310/mcp",{method:"POST"}).then(r=>{if(r.status!==401)process.exit(1)}).catch(()=>process.exit(1))']
+
+  ops-bridge:
+    <<: *ops-node
+    profiles: [ops-ready]
+    command: [node, ops-bridge/main.mjs]
+    environment:
+      OPS_BIND_HOST: 0.0.0.0
+      OPS_BRIDGE_PORT: '4310'
+      OPS_DATA_DIR: /var/lib/ops
+      OPS_MCP_TOKEN: '${OPS_MCP_TOKEN:?Run node deploy/ops.mjs init}'
+      OPS_BRIDGE_TOKEN: '${OPS_BRIDGE_TOKEN:?Run node deploy/ops.mjs init}'
+      OPS_EXECUTOR_URL: http://ops-executor:4320
+      OPS_APPROVAL_URL: http://127.0.0.1:4320/review
+      OPENBOT_BASE_URL: http://openbot:3001
+      OPENBOT_API_KEY: '${OPENBOT_API_KEY:-}'
+      OPENBOT_ORGANIZATION_ID: '${OPENBOT_ORGANIZATION_ID:-}'
+      OPENBOT_BOT_ID: '${OPENBOT_BOT_ID:-}'
+    volumes: [ops-bridge-data:/var/lib/ops]
+    networks: [bridge-mcp, bridge-executor, bridge-openbot]
+    depends_on:
+      ops-executor: { condition: service_healthy }
+      openbot: { condition: service_healthy }
+    healthcheck:
+      <<: *node-health
+      test: ['CMD', 'node', '-e', 'fetch("http://127.0.0.1:4310/healthz").then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))']
+
+  ops-agent-gateway:
+    <<: *ops-node
+    command: [node, deploy/gateway.mjs, agent]
+    depends_on:
+      ops-executor: { condition: service_healthy }
+    networks: [openbot-agent, executor-agent]
+    healthcheck:
+      <<: *node-health
+      test: ['CMD', 'node', '-e', 'fetch("http://127.0.0.1:4320/agent",{method:"POST"}).then(r=>{if(r.status!==401)process.exit(1)}).catch(()=>process.exit(1))']
+
+  ops-review-gateway:
+    <<: *ops-node
+    command: [node, deploy/gateway.mjs, review]
+    ports: ['127.0.0.1:4320:8080']
+    depends_on:
+      ops-executor: { condition: service_healthy }
+    networks: [review-edge, executor-review]
+    healthcheck:
+      <<: *node-health
+      test: ['CMD', 'node', '-e', 'fetch("http://127.0.0.1:8080/review").then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))']
+
+  ops-executor:
+    <<: *ops-node
+    command: [node, ops-executor/main.mjs]
+    environment:
+      OPS_BIND_HOST: 0.0.0.0
+      OPS_EXECUTOR_PORT: '4320'
+      OPS_DATA_DIR: /var/lib/ops
+      OPS_AGENT_TOKEN: '${OPS_AGENT_TOKEN:?Run node deploy/ops.mjs init}'
+      OPS_BRIDGE_TOKEN: '${OPS_BRIDGE_TOKEN:?Run node deploy/ops.mjs init}'
+      OPS_APPROVER_TOKEN: '${OPS_APPROVER_TOKEN:?Run node deploy/ops.mjs init}'
+      OPS_LAB_TOKEN: '${OPS_LAB_TOKEN:?Run node deploy/ops.mjs init}'
+      OPS_LAB_URL: http://ops-lab:4321
+      OPS_PROMETHEUS_URL: http://prometheus:9090
+    volumes: [ops-executor-data:/var/lib/ops]
+    networks: [bridge-executor, executor-agent, executor-review, executor-lab, executor-prom]
+    depends_on:
+      ops-lab: { condition: service_healthy }
+      prometheus: { condition: service_healthy }
+    healthcheck:
+      <<: *node-health
+      test: ['CMD', 'node', '-e', 'fetch("http://127.0.0.1:4320/healthz").then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))']
+
+  ops-lab:
+    <<: *ops-node
+    build:
+      context: .
+      dockerfile: deploy/ops.Dockerfile
+    command: [node, ops-executor/lab.mjs]
+    environment:
+      OPS_BIND_HOST: 0.0.0.0
+      OPS_LAB_PORT: '4321'
+      OPS_DATA_DIR: /var/lib/ops
+      OPS_LAB_TOKEN: '${OPS_LAB_TOKEN:?Run node deploy/ops.mjs init}'
+    volumes: [ops-lab-data:/var/lib/ops]
+    networks: [executor-lab, prom-scrape]
+    healthcheck:
+      <<: *node-health
+      # Liveness intentionally survives the lab's failing postcheck and compensation.
+      test: ['CMD', 'node', '-e', 'fetch("http://127.0.0.1:4321/metrics").then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))']
+
+  prometheus:
+    image: prom/prometheus:v3.9.1@sha256:1f0f50f06acaceb0f5670d2c8a658a599affe7b0d8e78b898c1035653849a702
+    user: '65534:65534'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.50
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=3d
+      - --storage.tsdb.retention.size=128MB
+      - --query.timeout=5s
+      - --query.max-concurrency=4
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ops-prometheus-data:/prometheus
+    networks: [executor-prom, prom-scrape]
+    healthcheck:
+      interval: 5s
+      timeout: 4s
+      retries: 15
+      test: ['CMD', '/bin/wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:9090/-/ready']
+    logging:
+      driver: json-file
+      options: { max-size: '10m', max-file: '3' }
+
+networks:
+  portal-mcp:
+    internal: true
+    ipam:
+      config: [{ subnet: 172.30.231.0/29, ip_range: 172.30.231.4/30 }]
+  bridge-mcp: { internal: true }
+  bridge-executor: { internal: true }
+  bridge-openbot: { internal: true }
+  openbot-agent: { internal: true }
+  executor-agent: { internal: true }
+  executor-review: { internal: true }
+  executor-lab: { internal: true }
+  executor-prom: { internal: true }
+  prom-scrape: { internal: true }
+  openbot-egress: {}
+  review-edge: {}
+
+volumes:
+  openbot-postgres: {}
+  openbot-workspace: {}
+  openbot-profiles: {}
+  ops-bridge-data: {}
+  ops-executor-data: {}
+  ops-lab-data: {}
+  ops-prometheus-data: {}

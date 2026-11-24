@@ -1,0 +1,6 @@
+.env
+.env.*
+!.env.example
+.warden-data/
+.ops-data/
+node_modules/

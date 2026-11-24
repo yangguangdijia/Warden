@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Warden · 变更审批</title>
+<style nonce="__WARDEN_NONCE__">
+:root{color-scheme:light;--bg:#edf1f5;--paper:#fff;--ink:#142136;--muted:#485b70;--line:#ccd5df;--accent:#174c56;--warn:#763a16;font:16px/1.6 "Segoe UI","Microsoft YaHei",sans-serif}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink)}header{background:#142136;color:#fff;padding:1.2rem max(1.2rem,calc((100vw - 800px)/2));letter-spacing:.08em}main{max-width:800px;margin:auto;padding:2rem 1.2rem 4rem}h1{font-size:clamp(1.8rem,5vw,3rem);line-height:1.2;margin:.3rem 0}p{margin:.5rem 0 1rem;color:var(--muted)}section,form{border:1px solid var(--line);border-radius:.65rem;padding:1rem 1.15rem;background:var(--paper);margin-top:1rem}label,input{display:block;width:100%}label{font-weight:600;margin-bottom:.4rem}input,button{padding:.65rem .85rem;border:1px solid var(--line);border-radius:.35rem;font:inherit}button{margin-top:.85rem;background:var(--accent);color:#fff;cursor:pointer}button:disabled{opacity:.55;cursor:default}input:focus-visible,button:focus-visible{outline:3px solid #3874a6;outline-offset:3px}pre,code{overflow-wrap:anywhere;white-space:pre-wrap;font: .87rem/1.55 Consolas,monospace}h2{font-size:1.15rem;margin:0 0 .6rem}.warning{color:var(--warn)}[hidden]{display:none}
+</style>
+</head>
+<body>
+<header>WARDEN / 人工变更控制</header>
+<main>
+<h1>核对并批准变更</h1>
+<p>仅限登记的实验服务。提交审批后，执行器会核对原版本、实施变更并验证实际状态。</p>
+<p>任务编号：<code id="id">—</code></p>
+<form id="connect">
+<label for="token">审批员令牌</label>
+<input id="token" type="password" autocomplete="off" spellcheck="false" required maxlength="512">
+<button id="load" type="submit">读取变更计划</button>
+</form>
+<p id="status" role="status" aria-live="polite"></p>
+<section id="details" hidden>
+<h2>计划与执行证据</h2>
+<pre id="record"></pre>
+<p class="warning" id="confirmation" hidden>批准将执行上方绑定摘要的实验变更。</p>
+<button type="button" id="approve" hidden>批准并执行</button>
+<button type="button" id="refresh">刷新记录</button>
+<button type="button" id="disconnect">结束审批会话</button>
+</section>
+</main>
+<script nonce="__WARDEN_NONCE__">
+(() => {
+  const get = (id) => document.getElementById(id);
+  const taskId = new URL(location.href).searchParams.get('taskId') ?? '';
+  const valid = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(taskId);
+  let token, task, busy = false;
+  get('id').textContent = valid ? taskId : '不合法或缺失';
+  const say = (message) => { get('status').textContent = message; };
+  const canApprove = () => task?.status === 'awaiting_approval' && /^[a-f0-9]{64}$/.test(task.digest ?? '');
+  function render() {
+    get('load').disabled = busy || !valid;
+    get('details').hidden = !task;
+    get('connect').hidden = Boolean(token && task);
+    get('approve').hidden = !canApprove();
+    get('confirmation').hidden = !canApprove();
+    for (const key of ['approve', 'refresh', 'disconnect']) get(key).disabled = busy;
+    get('record').textContent = task ? JSON.stringify(task, null, 2) : '';
+  }
+  async function send(data) {
+    busy = true;
+    render();
+    try {
+      const response = await fetch(`/approvals/${taskId}`, {
+        method: data ? 'POST' : 'GET', cache: 'no-store', redirect: 'error', credentials: 'omit',
+        signal: AbortSignal.timeout(10000),
+        headers: { Authorization: `Bearer ${token}`, ...(data ? { 'Content-Type': 'application/json' } : {}) },
+        ...(data ? { body: JSON.stringify(data) } : {}),
+      });
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) { token = undefined; task = undefined; }
+        throw new Error(`请求未完成 (HTTP ${response.status})。请重新读取记录，避免重复批准。`);
+      }
+      const result = await response.json();
+      if (result.id !== taskId) throw new Error('服务返回的任务编号与当前页面不一致。');
+      task = result;
+      say(data ? '审批请求已处理，以下为最新执行记录。' : '已读取记录，请核对任务和变更摘要。');
+    } catch (error) {
+      if (data && task) task = { ...task, digest: null };
+      say(error.message || '请求失败。');
+    } finally {
+      busy = false;
+      render();
+    }
+  }
+  get('connect').addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (busy || !valid) return;
+    token = get('token').value.trim();
+    get('token').value = '';
+    if (token) void send();
+  });
+  get('approve').addEventListener('click', () => { if (!busy && canApprove()) void send({ digest: task.digest }); });
+  get('refresh').addEventListener('click', () => { if (!busy && token) void send(); });
+  get('disconnect').addEventListener('click', () => { token = undefined; task = undefined; say('已清除本页令牌。'); render(); get('token').focus(); });
+  if (!valid) say('请从 LobeHub 的任务查询结果打开审批链接。');
+  render();
+})();
+</script>
+</body>
+</html>

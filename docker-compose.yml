@@ -1,0 +1,169 @@
+# Local, single-host LobeHub. Start with node portal/portal.mjs init, then up.
+name: ai-platform-portal
+
+# Both storage services use the same release. The image includes curl and rc.
+x-storage-image: &storage-image ghcr.io/rustfs/rustfs:1.0.6@sha256:ee717072290bec9b11abfc0365f8310b00df1cd9b3639943edae47bdef05044a
+
+services:
+  portal:
+    image: lobehub/lobehub:2.3.4
+    init: true
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:3210:3210'
+    environment:
+      APP_URL: http://127.0.0.1:3210
+      INTERNAL_APP_URL: http://127.0.0.1:3210
+      AUTH_SECRET: '${PORTAL_AUTH_SECRET:?Run node portal/portal.mjs init and up}'
+      KEY_VAULTS_SECRET: '${PORTAL_VAULT_SECRET:?Portal vault key is required}'
+      JWKS_KEY: '${PORTAL_JWKS_KEY:?Portal signing key is required}'
+      AUTH_ALLOWED_EMAILS: '${PORTAL_ALLOWED_EMAIL:?Portal email allowlist is required}'
+      AUTH_DISABLE_EMAIL_PASSWORD: '${PORTAL_DISABLE_PASSWORD:?Use the portal launcher}'
+      AUTH_ENABLE_MAGIC_LINK: '0'
+      AUTH_EMAIL_VERIFICATION: '0'
+      AUTH_SSO_PROVIDERS: '${PORTAL_SSO_PROVIDERS:-}'
+      AUTH_GENERIC_OIDC_ID: '${PORTAL_OIDC_CLIENT_ID:-}'
+      AUTH_GENERIC_OIDC_SECRET: '${PORTAL_OIDC_CLIENT_SECRET:-}'
+      AUTH_GENERIC_OIDC_ISSUER: '${PORTAL_OIDC_ISSUER:-}'
+      DATABASE_URL: 'postgresql://postgres:${PORTAL_POSTGRES_PASSWORD:?Portal database password is required}@postgres:5432/lobehub'
+      MIGRATION_DB: '1'
+      REDIS_URL: 'redis://:${PORTAL_REDIS_PASSWORD:?Portal Redis password is required}@redis:6379'
+      REDIS_PREFIX: lobehub
+      REDIS_TLS: '0'
+      S3_ENDPOINT: http://127.0.0.1:9000
+      S3_INTERNAL_ENDPOINT: http://storage:9000
+      S3_BUCKET: lobehub
+      S3_ENABLE_PATH_STYLE: '1'
+      S3_SET_ACL: '0'
+      S3_ACCESS_KEY: '${PORTAL_S3_APP_ID:?Portal S3 access key is required}'
+      S3_ACCESS_KEY_ID: '${PORTAL_S3_APP_ID:?Portal S3 access key is required}'
+      S3_SECRET_ACCESS_KEY: '${PORTAL_S3_APP_SECRET:?Portal S3 secret key is required}'
+      LLM_VISION_IMAGE_USE_BASE64: '1'
+      ENABLE_AGENT_GATEWAY: '0'
+      ENABLED_OPENAI: '${PORTAL_OPENAI_ENABLED:?Use the portal launcher}'
+      OPENAI_PROXY_URL: '${PORTAL_OPENAI_URL:-}'
+      OPENAI_API_KEY: '${PORTAL_OPENAI_KEY:-}'
+      OPENAI_MODEL_LIST: '${PORTAL_OPENAI_MODEL_LIST:--all}'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - /bin/node
+        - -e
+        - 'fetch("http://127.0.0.1:3210/api/auth/get-session",{signal:AbortSignal.timeout(2500)}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))'
+      interval: 5s
+      timeout: 4s
+      start_period: 90s
+      retries: 24
+    networks: [data, storage-edge]
+
+  postgres:
+    image: paradedb/paradedb:0.25.9-pg17
+    restart: unless-stopped
+    command: ['postgres', '-c', 'shared_preload_libraries=pg_search,pg_cron,pg_stat_statements']
+    environment:
+      POSTGRES_DB: lobehub
+      POSTGRES_PASSWORD: '${PORTAL_POSTGRES_PASSWORD:?Portal database password is required}'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # TCP avoids the socket-only server used during first-start initialization.
+      test: ['CMD', 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres', '-d', 'lobehub']
+      interval: 5s
+      timeout: 4s
+      start_period: 60s
+      retries: 24
+    networks: [data]
+
+  redis:
+    image: redis:7.4.8-alpine
+    restart: unless-stopped
+    environment:
+      REDISCLI_AUTH: '${PORTAL_REDIS_PASSWORD:?Portal Redis password is required}'
+    command: ['sh', '-ec', 'exec docker-entrypoint.sh redis-server --appendonly yes --requirepass "$$REDISCLI_AUTH"']
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD-SHELL', '[ "$$(redis-cli ping)" = PONG ]']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [data]
+
+  storage:
+    image: *storage-image
+    restart: unless-stopped
+    ports:
+      # Browser presigned PUT and GET requests. Port 9001 stays unpublished.
+      - '127.0.0.1:9000:9000'
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_CONSOLE_ENABLE: 'false'
+      RUSTFS_ACCESS_KEY: '${PORTAL_S3_ADMIN_ID:?Portal storage admin access key is required}'
+      RUSTFS_SECRET_KEY: '${PORTAL_S3_ADMIN_SECRET:?Portal storage admin secret key is required}'
+    volumes:
+      - storage-data:/data
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', '--max-time', '2', 'http://127.0.0.1:9000/health/ready']
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 24
+    networks: [storage-edge]
+
+  storage-init:
+    image: *storage-image
+    restart: 'no'
+    depends_on:
+      storage:
+        condition: service_healthy
+    environment:
+      RC_HOST_storage: 'http://${PORTAL_S3_ADMIN_ID:?Portal storage admin access key is required}:${PORTAL_S3_ADMIN_SECRET:?Portal storage admin secret key is required}@storage:9000'
+      RC_HOST_scoped: 'http://${PORTAL_S3_APP_ID:?Portal S3 access key is required}:${PORTAL_S3_APP_SECRET:?Portal S3 secret key is required}@storage:9000'
+      RC_CONFIG_DIR: /tmp/portal-rc
+      S3_APP_ID: '${PORTAL_S3_APP_ID:?Portal S3 access key is required}'
+      S3_APP_SECRET: '${PORTAL_S3_APP_SECRET:?Portal S3 secret key is required}'
+    tmpfs: [/tmp]
+    entrypoint: ['/bin/sh', '-ec']
+    command:
+      - |
+        run() {
+          step="$$1"
+          shift
+          if ! "$$@" >/dev/null 2>&1; then
+            printf 'Portal storage initialization failed (%s). Check the storage service and saved portal credentials.\n' "$$step" >&2
+            exit 1
+          fi
+        }
+        umask 077
+        printf '%s\n' '{"block_public_acls":true,"block_public_policy":true,"ignore_public_acls":true,"restrict_public_buckets":true}' > /tmp/access-block.json
+        printf '%s\n' '<CORSConfiguration><CORSRule><AllowedOrigin>http://127.0.0.1:3210</AllowedOrigin><AllowedMethod>GET</AllowedMethod><AllowedMethod>HEAD</AllowedMethod><AllowedMethod>PUT</AllowedMethod><AllowedHeader>*</AllowedHeader><ExposeHeader>ETag</ExposeHeader><MaxAgeSeconds>600</MaxAgeSeconds></CORSRule></CORSConfiguration>' > /tmp/cors.xml
+        printf '%s\n' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetBucketLocation","s3:ListBucket","s3:ListBucketMultipartUploads"],"Resource":["arn:aws:s3:::lobehub"]},{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":["arn:aws:s3:::lobehub/*"]}]}' > /tmp/lobehub-policy.json
+        run 'bucket creation' rc bucket create storage/lobehub --ignore-existing
+        run 'public access block' rc bucket public-access-block set storage/lobehub /tmp/access-block.json
+        run 'browser CORS' rc bucket cors set storage/lobehub /tmp/cors.xml
+        run 'application user' rc admin user add storage "$$S3_APP_ID" "$$S3_APP_SECRET"
+        run 'application policy' rc admin policy create storage lobehub-app /tmp/lobehub-policy.json
+        # Attach can return NoPolicyChange on an existing user. The scoped probe below is authoritative.
+        rc admin policy attach storage lobehub-app --user "$$S3_APP_ID" >/dev/null 2>&1 || :
+        run 'application access' rc ls scoped/lobehub
+        printf '%s\n' 'Private LobeHub bucket is ready.'
+    networks: [storage-edge]
+
+networks:
+  data:
+    internal: true
+  storage-edge: {}
+
+volumes:
+  postgres-data: {}
+  redis-data: {}
+  storage-data: {}

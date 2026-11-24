@@ -1,0 +1,12 @@
+**
+!ops-bridge/
+!ops-bridge/*.mjs
+!ops-bridge/*.html
+!ops-executor/
+!ops-executor/*.mjs
+!ops-executor/*.html
+!warden/
+!warden/policy.mjs
+!deploy/
+!deploy/ops.Dockerfile
+!deploy/gateway.mjs
